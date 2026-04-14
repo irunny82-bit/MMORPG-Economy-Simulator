@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>모바일 MMORPG 경제 & 확률 기반 VSM 시뮬레이터</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'mmo-primary': '#EAB308', 
+                        'mmo-bg': '#0F172A', 
+                        'mmo-card': '#1E293B',
+                        'mmo-text': '#F8FAFC',
+                        'mmo-accent': '#EF4444',
+                        'mmo-blue': '#3B82F6',
+                        'mmo-green': '#10B981',
+                        'mmo-purple': '#8B5CF6'
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background-color: #0F172A; color: #F8FAFC; font-family: 'Pretendard', sans-serif; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #1E293B; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        
+        input[type="number"], input[type="text"], select {
+            background-color: #334155;
+            color: white;
+            border-color: #475569;
+        }
+        input:focus, select:focus {
+            outline: none;
+            border-color: #EAB308;
+            box-shadow: 0 0 0 1px #EAB308;
+        }
+        .arrow-flow { animation: flow 2s infinite linear; }
+        @keyframes flow {
+            0% { transform: translateX(-4px); opacity: 0.5; }
+            50% { transform: translateX(4px); opacity: 1; }
+            100% { transform: translateX(-4px); opacity: 0.5; }
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        const DashboardCard = ({ title, children, icon, className="" }) => (
+            <div className={`bg-mmo-card rounded-2xl shadow-lg border border-slate-700 p-5 ${className}`}>
+                {title && <h3 className="text-lg font-bold text-slate-100 mb-4 flex items-center gap-2">
+                    {icon && <i data-lucide={icon} className="w-5 h-5 text-mmo-primary"></i>}
+                    {title}
+                </h3>}
+                {children}
+            </div>
+        );
+
+        const LongTermChart = ({ timeline }) => {
+            const canvasRef = useRef(null);
+            const chartRef = useRef(null);
+
+            useEffect(() => {
+                if (chartRef.current) chartRef.current.destroy();
+                const ctx = canvasRef.current.getContext('2d');
+                const labels = Array.from({length: 12}, (_, i) => `${i+1}개월`);
+                
+                const monthlyData = [];
+                for(let i=1; i<=12; i++){
+                    const dayIdx = Math.min((i * 30) - 1, timeline.length - 1);
+                    monthlyData.push(timeline[dayIdx]);
+                }
+
+                chartRef.current = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            { 
+                                type: 'line',
+                                label: '누적 골드(G)', 
+                                data: monthlyData, 
+                                borderColor: '#EAB308', 
+                                backgroundColor: 'rgba(234, 179, 8, 0.1)', 
+                                fill: true, tension: 0.3 
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true, maintainAspectRatio: false, color: '#94A3B8',
+                        scales: {
+                            x: { ticks: { color: '#94A3B8' }, grid: { color: '#334155' } },
+                            y: { display: true, title: {display:true, text:'보유 골드', color:'#94A3B8'}, ticks:{color:'#94A3B8'}, grid:{color:'#334155'} }
+                        },
+                        plugins: { legend: { labels: { color: '#F1F5F9' } } }
+                    }
+                });
+                return () => { if (chartRef.current) chartRef.current.destroy(); };
+            }, [timeline]);
+            return <canvas ref={canvasRef}></canvas>;
+        };
+
+        const STONE_GRADES = {
+            normal: { name: '일반', color: 'text-slate-300' },
+            advanced: { name: '상급', color: 'text-emerald-400' },
+            highest: { name: '최상급', color: 'text-blue-400' },
+            heroic: { name: '영웅', color: 'text-purple-400' },
+            legend: { name: '전설', color: 'text-mmo-primary' }
+        };
+
+        const EQUIP_GRADES = [
+            { name: '일반', multiplier: 1.0, color: 'text-slate-300', stoneKey: 'normal' },
+            { name: '고급', multiplier: 1.2, color: 'text-emerald-400', stoneKey: 'advanced' },
+            { name: '희귀', multiplier: 1.5, color: 'text-blue-400', stoneKey: 'highest' },
+            { name: '영웅', multiplier: 2.0, color: 'text-purple-400', stoneKey: 'heroic' },
+            { name: '전설', multiplier: 3.0, color: 'text-mmo-primary', stoneKey: 'legend' }
+        ];
+
+        const App = () => {
+            const [activeTab, setActiveTab] = useState('data'); 
+            useEffect(() => { lucide.createIcons(); });
+
+            // ==========================================
+            // [Tab 1] 글로벌 모디파이어 (신규 추가)
+            // ==========================================
+            const [globalMods, setGlobalMods] = useState({
+                goldBoost: 0,       // 골드 획득량 증가 (%)
+                dropBoost: 0,       // 아이템 드랍률 증가 (%)
+                enhanceDiscount: 0  // 강화 비용 할인 (%)
+            });
+
+            // ==========================================
+            // [Tab 1] 밸런스 기초 데이터
+            // ==========================================
+            const [ecoModel, setEcoModel] = useState('시장');
+            const [tradeFee, setTradeFee] = useState(5);
+            const [hasPriceBand, setHasPriceBand] = useState(true);
+
+            const [mainQuest, setMainQuest] = useState({
+                baseGold: 5000,
+                diffMultiplier: 1.1,
+                stoneReward: 2,
+                runTime: 5 
+            });
+
+            const [dungeons, setDungeons] = useState([
+                { grade: '일반', unlockLv: 10, dailyLimit: 10, runTime: 3, goldPerRun: 5000, stoneDropRate: { normal: 80, advanced: 15, highest: 5, heroic: 0, legend: 0 } },
+                { grade: '어려움', unlockLv: 30, dailyLimit: 5, runTime: 5, goldPerRun: 15000, stoneDropRate: { normal: 20, advanced: 50, highest: 25, heroic: 5, legend: 0 } },
+                { grade: '레이드', unlockLv: 50, dailyLimit: 3, runTime: 10, goldPerRun: 40000, stoneDropRate: { normal: 0, advanced: 10, highest: 40, heroic: 40, legend: 10 } }
+            ]);
+
+            // ==========================================
+            // [Tab 2] 거시 경제 변수 (생산/소비)
+            // ==========================================
+            const [playHours, setPlayHours] = useState(4);
+            const playMinutes = playHours * 60;
+            const [contentRatio, setContentRatio] = useState({ quest: 80, town: 20 }); 
+            const [dungeonGradeFocus, setDungeonGradeFocus] = useState(0);
+            
+            const [dailyFixedSink, setDailyFixedSink] = useState(150000); 
+            const [dailyGrowthSink, setDailyGrowthSink] = useState(300000); 
+
+            const macroStats = useMemo(() => {
+                const focusDungeon = dungeons[dungeonGradeFocus];
+                
+                const maxDungeonMins = focusDungeon.dailyLimit * focusDungeon.runTime;
+                const actualDungeonMins = Math.min(playMinutes, maxDungeonMins); 
+                const actualDungeonRuns = Math.floor(actualDungeonMins / focusDungeon.runTime);
+                
+                // 글로벌 모디파이어 (골드 부스트) 적용
+                const boostedGoldPerRun = focusDungeon.goldPerRun * (1 + globalMods.goldBoost / 100);
+                const dungeonGold = actualDungeonRuns * boostedGoldPerRun;
+
+                const remainingMins = Math.max(0, playMinutes - actualDungeonMins);
+                const questMins = remainingMins * (contentRatio.quest / 100);
+                const questRuns = Math.floor(questMins / (mainQuest.runTime || 5)); 
+                
+                // 글로벌 모디파이어 (골드 부스트) 적용
+                const boostedQuestGold = (mainQuest.baseGold * mainQuest.diffMultiplier) * (1 + globalMods.goldBoost / 100);
+                const questGold = questRuns * boostedQuestGold;
+                
+                const totalProduction = questGold + dungeonGold;
+                const tradeVolume = totalProduction * 0.3;
+                const taxSink = ecoModel === '폐쇄' ? 0 : tradeVolume * (tradeFee / 100);
+                const totalConsumption = dailyFixedSink + dailyGrowthSink + taxSink;
+
+                const netDaily = totalProduction - totalConsumption;
+                const ratio = totalConsumption > 0 ? (totalProduction / totalConsumption) : 0;
+
+                const timeline = [];
+                let currentGold = 0;
+                for(let i=0; i<365; i++){
+                    currentGold += netDaily;
+                    timeline.push(currentGold);
+                }
+
+                return { 
+                    totalProduction, totalConsumption, taxSink, netDaily, ratio, timeline, 
+                    actualDungeonRuns, actualDungeonMins, remainingMins, questMins, questRuns, questGold, dungeonGold
+                };
+            }, [playHours, contentRatio, dungeonGradeFocus, dungeons, dailyFixedSink, dailyGrowthSink, ecoModel, tradeFee, mainQuest, globalMods]);
+
+            // ==========================================
+            // [Tab 3] 강화 & VSM 상태 변수
+            // ==========================================
+            const [enhanceTable, setEnhanceTable] = useState(
+                Array.from({length: 10}, (_, i) => ({
+                    level: i + 1,
+                    gold: (i + 1) * 100,
+                    stone: (i + 1) * 1,
+                    prob: (i + 1) <= 3 ? 100 : Math.max(5, 100 - ((i + 1) - 3) * 10)
+                }))
+            );
+
+            const [selectedEquipGrade, setSelectedEquipGrade] = useState(0); 
+            const targetStoneGrade = EQUIP_GRADES[selectedEquipGrade].stoneKey; 
+            const [targetLevel, setTargetLevel] = useState(5); 
+
+            // VSM 강화 연산
+            const vsmData = useMemo(() => {
+                const equipMultiplier = EQUIP_GRADES[selectedEquipGrade].multiplier;
+                const targetEnhance = enhanceTable[targetLevel - 1] || enhanceTable[0];
+
+                // 글로벌 모디파이어 (비용 할인) 적용
+                const costG = Math.floor(targetEnhance.gold * equipMultiplier * (1 - globalMods.enhanceDiscount / 100));
+                const costS = Math.floor(targetEnhance.stone * equipMultiplier * (1 - globalMods.enhanceDiscount / 100));
+                
+                const prob = targetEnhance.prob;
+                // 강화 기댓값 연산 (핵심 밸런스 공식)
+                const expectedTries = 100 / Math.max(0.01, prob);
+
+                const successGold = costG;
+                const successStone = costS;
+                const wasteGold = costG * (expectedTries - 1);
+                const wasteStone = costS * (expectedTries - 1);
+
+                const reqTotalGold = successGold + wasteGold;
+                const reqTotalStone = successStone + wasteStone;
+
+                const dungeonReqs = dungeons.map(d => {
+                    // 글로벌 모디파이어 (드랍률 부스트) 적용
+                    const specificStoneDropRate = d.stoneDropRate[targetStoneGrade];
+                    const expectedStonePerRun = (specificStoneDropRate / 100) * 1.5 * (1 + globalMods.dropBoost / 100);
+                    
+                    const boostedGoldPerRun = d.goldPerRun * (1 + globalMods.goldBoost / 100);
+                    
+                    const runsForStone = expectedStonePerRun > 0 ? Math.ceil(reqTotalStone / expectedStonePerRun) : Infinity;
+                    const runsForGold = boostedGoldPerRun > 0 ? Math.ceil(reqTotalGold / boostedGoldPerRun) : Infinity;
+                    
+                    const reqRuns = Math.max(runsForGold, runsForStone);
+                    const daysNeeded = reqRuns === Infinity ? Infinity : Math.ceil(reqRuns / d.dailyLimit);
+                    const runTimeTotal = reqRuns === Infinity ? Infinity : reqRuns * d.runTime;
+                    
+                    return { ...d, reqRuns, daysNeeded, runTimeTotal };
+                });
+
+                return { 
+                    costG, costS, prob, expectedTries,
+                    successGold, successStone, wasteGold, wasteStone, 
+                    reqTotalGold, reqTotalStone, dungeonReqs
+                };
+            }, [enhanceTable, selectedEquipGrade, targetLevel, dungeons, targetStoneGrade, globalMods]);
+
+            const [vsmActivities, setVsmActivities] = useState([
+                { id: 1, type: 'source', name: '메인 퀘스트 1회', count: 5, gold: mainQuest.baseGold * mainQuest.diffMultiplier, stone: mainQuest.stoneReward, time: 5 },
+                { id: 2, type: 'source', name: '던전 일반 파밍', count: 3, gold: dungeons[0].goldPerRun, stone: 2, time: dungeons[0].runTime },
+                { id: 3, type: 'sink', name: `장비 강화 시도`, count: 2, gold: 500, stone: 1, time: 1 }
+            ]);
+
+            const handleVsmChange = (id, field, val) => {
+                setVsmActivities(prev => prev.map(act => act.id === id ? { ...act, [field]: Number(val) } : act));
+            };
+
+            const vsmTableStats = useMemo(() => {
+                let prod = { gold: 0, stone: 0, time: 0 };
+                let cons = { gold: 0, stone: 0, time: 0 };
+
+                vsmActivities.forEach(act => {
+                    const mult = act.count;
+                    if (act.type === 'source') {
+                        prod.gold += act.gold * mult;
+                        prod.stone += act.stone * mult;
+                        prod.time += act.time * mult;
+                    } else {
+                        cons.gold += act.gold * mult;
+                        cons.stone += act.stone * mult;
+                        cons.time += act.time * mult;
+                    }
+                });
+
+                const leadTime = prod.time + cons.time;
+                return { prod, cons, leadTime };
+            }, [vsmActivities]);
+
+            const syncTableWithVsm = () => {
+                const focusDungeon = dungeons[dungeonGradeFocus];
+                const dReq = vsmData.dungeonReqs[dungeonGradeFocus];
+                
+                const runCount = dReq.reqRuns === Infinity ? 0 : Math.min(dReq.reqRuns, focusDungeon.dailyLimit); 
+                
+                const specificStoneDropRate = focusDungeon.stoneDropRate[targetStoneGrade];
+                const expectedStonePerRun = Number(((specificStoneDropRate / 100) * 1.5 * (1 + globalMods.dropBoost / 100)).toFixed(2));
+                const boostedGoldPerRun = focusDungeon.goldPerRun * (1 + globalMods.goldBoost / 100);
+                const boostedQuestGold = (mainQuest.baseGold * mainQuest.diffMultiplier) * (1 + globalMods.goldBoost / 100);
+
+                setVsmActivities([
+                    { id: 1, type: 'source', name: '메인 퀘스트 보상', count: macroStats.questRuns, gold: boostedQuestGold, stone: mainQuest.stoneReward, time: mainQuest.runTime },
+                    { id: 2, type: 'source', name: `${focusDungeon.grade} 던전 클리어`, count: runCount, gold: boostedGoldPerRun, stone: expectedStonePerRun, time: focusDungeon.runTime },
+                    { id: 3, type: 'sink', name: `+${targetLevel}강 강화 시도`, count: 1, gold: vsmData.costG, stone: vsmData.costS, time: 1 },
+                ]);
+            };
+
+            return (
+                <div className="min-h-screen pb-12">
+                    <header className="bg-mmo-card border-b border-slate-800 sticky top-0 z-10 shadow-lg">
+                        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div className="flex justify-between items-center h-16 flex-wrap">
+                                <div className="flex items-center gap-2">
+                                    <div className="w-8 h-8 bg-gradient-to-br from-mmo-primary to-orange-500 rounded-lg flex items-center justify-center shadow-lg">
+                                        <i data-lucide="layers" className="text-slate-900 w-5 h-5 font-black"></i>
+                                    </div>
+                                    <h1 className="text-xl font-black text-slate-100 tracking-tight">MMORPG <span className="text-mmo-primary font-bold">Economy Simulator</span></h1>
+                                </div>
+                                <div className="flex gap-1 overflow-x-auto mt-2 md:mt-0 pb-1 md:pb-0">
+                                    <button onClick={() => setActiveTab('data')} className={`px-4 py-2 text-sm font-bold rounded-t-lg whitespace-nowrap transition-colors ${activeTab === 'data' ? 'bg-slate-800 text-mmo-primary border-t-2 border-mmo-primary' : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'}`}>1. 밸런스 & 시스템 설정</button>
+                                    <button onClick={() => setActiveTab('sim')} className={`px-4 py-2 text-sm font-bold rounded-t-lg whitespace-nowrap transition-colors ${activeTab === 'sim' ? 'bg-slate-800 text-emerald-400 border-t-2 border-emerald-400' : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'}`}>2. 거시 경제 (생산/소비)</button>
+                                    <button onClick={() => setActiveTab('vsm')} className={`px-4 py-2 text-sm font-bold rounded-t-lg whitespace-nowrap transition-colors ${activeTab === 'vsm' ? 'bg-slate-800 text-purple-400 border-t-2 border-purple-400' : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'}`}>3. 장비 강화 & VSM 흐름</button>
+                                </div>
+                            </div>
+                        </div>
+                    </header>
+
+                    <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+                        
+                        {/* --- 시뮬레이션 목표 명시 패널 --- */}
+                        <div className="bg-gradient-to-r from-slate-800 to-slate-900 border border-slate-700 rounded-xl p-5 shadow-lg relative overflow-hidden">
+                            <div className="absolute -top-4 -right-4 p-4 opacity-10 pointer-events-none">
+                                <i data-lucide="target" className="w-32 h-32 text-mmo-primary"></i>
+                            </div>
+                            <div className="relative z-10">
+                                <h2 className="text-sm font-black text-emerald-400 mb-3 flex items-center gap-2">
+                                    <i data-lucide="flag" className="w-4 h-4"></i>
+                                    시뮬레이션 검증 목표
+                                </h2>
+                                <p className="text-xs text-slate-400 mb-4">본 시뮬레이터는 다음 3가지의 핵심 기획 목표를 검증하고 설계하기 위해 제작되었습니다.</p>
+                                <ul className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                    <li className="flex items-start gap-2.5 text-sm text-slate-300 bg-slate-900/50 p-3 rounded-lg border border-slate-700/50">
+                                        <i data-lucide="check-circle-2" className="w-5 h-5 text-mmo-primary shrink-0"></i>
+                                        <span><b className="text-slate-100">유저의 하루 플레이 시간 기준</b><br/><span className="text-xs mt-1 block text-slate-400">경제 순환 안정성 검증</span></span>
+                                    </li>
+                                    <li className="flex items-start gap-2.5 text-sm text-slate-300 bg-slate-900/50 p-3 rounded-lg border border-slate-700/50">
+                                        <i data-lucide="check-circle-2" className="w-5 h-5 text-mmo-primary shrink-0"></i>
+                                        <span><b className="text-slate-100">강화 기댓값 산출 시스템</b>이<br/><span className="text-xs mt-1 block text-slate-400">경제에 미치는 소모 압력(Sink)</span></span>
+                                    </li>
+                                    <li className="flex items-start gap-2.5 text-sm text-slate-300 bg-slate-900/50 p-3 rounded-lg border border-slate-700/50">
+                                        <i data-lucide="check-circle-2" className="w-5 h-5 text-mmo-primary shrink-0"></i>
+                                        <span>콘텐츠별 <b className="text-slate-100">시간 기반 보상 산출</b><br/><span className="text-xs mt-1 block text-slate-400">(효율 밸런싱)</span></span>
+                                    </li>
+                                </ul>
+                            </div>
+                        </div>
+
+                        {/* ======================= Tab 1 ======================= */}
+                        {activeTab === 'data' && (
+                            <div className="animate-fade-in space-y-6">
+
+                                {/* --- 신규 추가: 글로벌 모디파이어 및 공식 모니터링 --- */}
+                                <DashboardCard title="글로벌 밸런스 제어 & 핵심 공식 모니터링" icon="cpu" className="border-emerald-500/30">
+                                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                                        {/* 글로벌 제어 패널 */}
+                                        <div className="space-y-4 bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-inner">
+                                            <h4 className="text-sm font-bold text-slate-200 border-b border-slate-600 pb-2 mb-3">🎛️ 일괄 변수 제어기 (Global Modifiers)</h4>
+                                            
+                                            <div>
+                                                <div className="flex justify-between items-center text-xs font-bold text-slate-300 mb-1">
+                                                    <span>💰 획득 골드 부스트 (이벤트 등)</span>
+                                                    <span className="text-mmo-primary">+{globalMods.goldBoost}%</span>
+                                                </div>
+                                                <input type="range" min="0" max="100" step="5" value={globalMods.goldBoost} onChange={e=>setGlobalMods({...globalMods, goldBoost: Number(e.target.value)})} className="w-full accent-mmo-primary" />
+                                            </div>
+
+                                            <div>
+                                                <div className="flex justify-between items-center text-xs font-bold text-slate-300 mb-1">
+                                                    <span>🎁 재료 드랍률 부스트 (핫타임)</span>
+                                                    <span className="text-emerald-400">+{globalMods.dropBoost}%</span>
+                                                </div>
+                                                <input type="range" min="0" max="100" step="5" value={globalMods.dropBoost} onChange={e=>setGlobalMods({...globalMods, dropBoost: Number(e.target.value)})} className="w-full accent-emerald-500" />
+                                            </div>
+
+                                            <div>
+                                                <div className="flex justify-between items-center text-xs font-bold text-slate-300 mb-1">
+                                                    <span>⚒️ 강화 비용 할인율 (패스 혜택 등)</span>
+                                                    <span className="text-rose-400">-{globalMods.enhanceDiscount}%</span>
+                                                </div>
+                                                <input type="range" min="0" max="50" step="5" value={globalMods.enhanceDiscount} onChange={e=>setGlobalMods({...globalMods, enhanceDiscount: Number(e.target.value)})} className="w-full accent-rose-500" />
+                                            </div>
+                                            <p className="text-[10px] text-slate-400 mt-2">* 이 수치를 조정하면 아래 모든 테이블과 2번, 3번 탭의 경제/기댓값 계산에 즉시 곱연산되어 반영됩니다.</p>
+                                        </div>
+
+                                        {/* 핵심 공식 뷰어 */}
+                                        <div className="space-y-3">
+                                            <h4 className="text-sm font-bold text-slate-200 border-b border-slate-700 pb-2 mb-2">📜 시스템 적용 핵심 공식 (Live)</h4>
+                                            
+                                            <div className="bg-slate-900 p-3 rounded-lg border border-slate-700">
+                                                <div className="text-[10px] text-slate-400 font-bold uppercase mb-1 flex items-center gap-1"><i data-lucide="clock" className="w-3 h-3"></i> 1. 시간 기반 일일 생산 공식 (상향식)</div>
+                                                <div className="text-xs font-mono text-emerald-400">
+                                                    총 생산량 = (1회 보상 × <span className="text-slate-100">글로벌 부스트</span>) × <span className="text-blue-400">(가용 시간 ÷ 1회 소요시간)</span>
+                                                </div>
+                                            </div>
+
+                                            <div className="bg-slate-900 p-3 rounded-lg border border-slate-700">
+                                                <div className="text-[10px] text-slate-400 font-bold uppercase mb-1 flex items-center gap-1"><i data-lucide="scale" className="w-3 h-3"></i> 2. 거시 경제 균형 공식 (인플레 억제)</div>
+                                                <div className="text-xs font-mono text-mmo-primary">
+                                                    일일 순수익 = 총 생산량 - [고정 소모 + <span className="text-rose-400">강화 소모</span> + 수수료]
+                                                </div>
+                                            </div>
+
+                                            <div className="bg-slate-900 p-3 rounded-lg border border-slate-700">
+                                                <div className="text-[10px] text-slate-400 font-bold uppercase mb-1 flex items-center gap-1"><i data-lucide="dice-5" className="w-3 h-3"></i> 3. 강화 기댓값 압력 공식 (Sink 연산)</div>
+                                                <div className="text-xs font-mono text-purple-400">
+                                                    요구 기댓값 = <span className="text-slate-100">100 / 성공확률(%)</span><br/>
+                                                    총 소모량 = 1회 시도비용 × 기댓값
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </DashboardCard>
+
+                                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                                    <div className="lg:col-span-8 space-y-6">
+                                        <DashboardCard title="핵심 파밍 루트: 던전 등급별 보상 테이블" icon="swords">
+                                            <div className="overflow-x-auto rounded-xl border border-slate-700">
+                                                <table className="w-full text-sm text-center border-collapse">
+                                                    <thead>
+                                                        <tr className="bg-slate-900 text-slate-400 border-b border-slate-700">
+                                                            <th className="p-3 font-bold" rowSpan="2">던전 등급</th>
+                                                            <th className="p-3 font-bold text-slate-300 border-l border-slate-700" rowSpan="2">개방<br/>Lv</th>
+                                                            <th className="p-3 font-bold text-rose-400 border-l border-slate-700" rowSpan="2">일일<br/>제한</th>
+                                                            <th className="p-3 font-bold text-emerald-400 border-l border-slate-700" rowSpan="2">소요<br/>시간</th>
+                                                            <th className="p-3 font-bold text-mmo-primary border-l border-slate-700" rowSpan="2">1회 골드 보상</th>
+                                                            <th className="p-2 font-bold border-l border-slate-700" colSpan="5">강화석 기본 드랍률 (%)</th>
+                                                        </tr>
+                                                        <tr className="bg-slate-800 text-[11px] font-bold text-slate-300 border-b border-slate-700">
+                                                            <th className="p-2 border-l border-slate-700">일반</th>
+                                                            <th className="p-2 border-l border-slate-700 text-emerald-400">상급</th>
+                                                            <th className="p-2 border-l border-slate-700 text-blue-400">최상급</th>
+                                                            <th className="p-2 border-l border-slate-700 text-purple-400">영웅</th>
+                                                            <th className="p-2 border-l border-slate-700 text-mmo-primary">전설</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-700/50 bg-slate-800/50">
+                                                        {dungeons.map((d, i) => (
+                                                            <tr key={i} className="hover:bg-slate-800 transition-colors">
+                                                                <td className="p-3 font-black text-slate-200">{d.grade}</td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={d.unlockLv} onChange={(e)=>{let arr=[...dungeons]; arr[i].unlockLv=Number(e.target.value); setDungeons(arr)}} className="w-12 bg-slate-900 border border-slate-600 rounded p-1 text-center"/></td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={d.dailyLimit} onChange={(e)=>{let arr=[...dungeons]; arr[i].dailyLimit=Number(e.target.value); setDungeons(arr)}} className="w-12 bg-slate-900 border border-rose-500/50 rounded p-1 text-center text-rose-400 font-bold"/></td>
+                                                                <td className="p-2 border-l border-slate-700 flex items-center justify-center gap-1"><input type="number" value={d.runTime} onChange={(e)=>{let arr=[...dungeons]; arr[i].runTime=Number(e.target.value); setDungeons(arr)}} className="w-12 bg-slate-900 border border-slate-600 rounded p-1 text-center text-emerald-400"/>분</td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={d.goldPerRun} onChange={(e)=>{let arr=[...dungeons]; arr[i].goldPerRun=Number(e.target.value); setDungeons(arr)}} className="w-20 bg-slate-900 border border-slate-600 rounded p-1 text-center text-mmo-primary font-bold"/></td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={d.stoneDropRate.normal} onChange={(e)=>{let arr=[...dungeons]; arr[i].stoneDropRate.normal=Number(e.target.value); setDungeons(arr)}} className="w-12 bg-slate-900 border border-slate-600 rounded p-1 text-center"/></td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={d.stoneDropRate.advanced} onChange={(e)=>{let arr=[...dungeons]; arr[i].stoneDropRate.advanced=Number(e.target.value); setDungeons(arr)}} className="w-12 bg-slate-900 border border-slate-600 rounded p-1 text-center"/></td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={d.stoneDropRate.highest} onChange={(e)=>{let arr=[...dungeons]; arr[i].stoneDropRate.highest=Number(e.target.value); setDungeons(arr)}} className="w-12 bg-slate-900 border border-slate-600 rounded p-1 text-center"/></td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={d.stoneDropRate.heroic} onChange={(e)=>{let arr=[...dungeons]; arr[i].stoneDropRate.heroic=Number(e.target.value); setDungeons(arr)}} className="w-12 bg-slate-900 border border-slate-600 rounded p-1 text-center"/></td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={d.stoneDropRate.legend} onChange={(e)=>{let arr=[...dungeons]; arr[i].stoneDropRate.legend=Number(e.target.value); setDungeons(arr)}} className="w-12 bg-slate-900 border border-slate-600 rounded p-1 text-center"/></td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </DashboardCard>
+
+                                        <DashboardCard title="장비 강화 밸런스 테이블 (1~10단계)" icon="hammer">
+                                            <p className="text-xs text-slate-400 mb-3">1회 시도에 요구되는 기본 비용과 확률입니다. 위 <span className="text-emerald-400 font-bold">글로벌 제어기</span>에 의해 할인/증가 효과가 2,3번 탭에 즉시 연동됩니다.</p>
+                                            <div className="overflow-x-auto rounded-xl border border-slate-700">
+                                                <table className="w-full text-sm text-center border-collapse">
+                                                    <thead>
+                                                        <tr className="bg-slate-900 text-slate-400 border-b border-slate-700 text-xs">
+                                                            <th className="p-3 font-bold w-20">강화 단계</th>
+                                                            <th className="p-3 font-bold text-mmo-primary border-l border-slate-700">1회 기본 시도 비용 (G)</th>
+                                                            <th className="p-3 font-bold text-purple-400 border-l border-slate-700">기본 필요 강화석 (개)</th>
+                                                            <th className="p-3 font-bold text-blue-400 border-l border-slate-700">성공 확률 (%)</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-700/50 bg-slate-800/50">
+                                                        {enhanceTable.map((row, i) => (
+                                                            <tr key={i} className="hover:bg-slate-800 transition-colors">
+                                                                <td className="p-2 font-black text-slate-200">+{row.level}</td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={row.gold} onChange={(e) => { let arr = [...enhanceTable]; arr[i].gold = Number(e.target.value); setEnhanceTable(arr); }} className="w-full bg-slate-900 border border-slate-600 rounded p-1.5 text-center text-mmo-primary font-bold focus:border-mmo-primary outline-none"/></td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={row.stone} onChange={(e) => { let arr = [...enhanceTable]; arr[i].stone = Number(e.target.value); setEnhanceTable(arr); }} className="w-full bg-slate-900 border border-slate-600 rounded p-1.5 text-center text-purple-400 font-bold focus:border-purple-500 outline-none"/></td>
+                                                                <td className="p-2 border-l border-slate-700"><input type="number" value={row.prob} onChange={(e) => { let arr = [...enhanceTable]; arr[i].prob = Number(e.target.value); setEnhanceTable(arr); }} className="w-full bg-slate-900 border border-slate-600 rounded p-1.5 text-center text-blue-400 font-bold focus:border-blue-500 outline-none"/></td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </DashboardCard>
+                                    </div>
+                                    
+                                    <div className="lg:col-span-4 space-y-6">
+                                        <DashboardCard title="메인 퀘스트 밸런스 설정" icon="scroll">
+                                            <div className="space-y-4">
+                                                <div>
+                                                    <label className="text-xs font-bold text-slate-400 mb-1 block uppercase">1회 소요 시간 (분)</label>
+                                                    <input type="number" value={mainQuest.runTime} onChange={e=>setMainQuest({...mainQuest, runTime:Number(e.target.value)})} className="w-full p-2 bg-slate-900 border border-slate-600 rounded font-bold text-emerald-400 text-right focus:border-emerald-500 outline-none" />
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs font-bold text-slate-400 mb-1 block uppercase">기본 획득 골드</label>
+                                                    <input type="number" value={mainQuest.baseGold} onChange={e=>setMainQuest({...mainQuest, baseGold:Number(e.target.value)})} className="w-full p-2 bg-slate-900 border border-slate-600 rounded font-bold text-mmo-primary text-right focus:border-mmo-primary outline-none" />
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs font-bold text-slate-400 mb-1 block uppercase">난이도별 보상 계수</label>
+                                                    <input type="number" step="0.1" value={mainQuest.diffMultiplier} onChange={e=>setMainQuest({...mainQuest, diffMultiplier:Number(e.target.value)})} className="w-full p-2 bg-slate-900 border border-slate-600 rounded font-bold text-slate-200 text-right focus:border-mmo-primary outline-none" />
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs font-bold text-slate-400 mb-1 block uppercase">기본 획득 강화석 수량</label>
+                                                    <input type="number" value={mainQuest.stoneReward} onChange={e=>setMainQuest({...mainQuest, stoneReward:Number(e.target.value)})} className="w-full p-2 bg-slate-900 border border-slate-600 rounded font-bold text-purple-400 text-right focus:border-purple-500 outline-none" />
+                                                </div>
+                                            </div>
+                                        </DashboardCard>
+
+                                        <DashboardCard title="거시 경제 체제" icon="globe">
+                                            <div className="space-y-4">
+                                                <div>
+                                                    <label className="text-xs font-bold text-slate-300 block mb-2 uppercase tracking-wide">경제 모델 분류</label>
+                                                    <select value={ecoModel} onChange={(e) => setEcoModel(e.target.value)} className="w-full p-2.5 rounded-lg bg-slate-900 border border-slate-600 font-bold shadow-inner">
+                                                        <option value="폐쇄">폐쇄 경제 (거래 불가)</option>
+                                                        <option value="시장">시장 경제 (경매장)</option>
+                                                        <option value="계획">계획 경제 (상하한가 제어)</option>
+                                                    </select>
+                                                </div>
+                                                {ecoModel !== '폐쇄' && (
+                                                    <div className="p-4 bg-slate-800 rounded-lg border border-slate-700 space-y-4">
+                                                        <div className="flex justify-between items-center">
+                                                            <span className="text-sm font-bold text-slate-300">거래소 수수료</span>
+                                                            <div className="flex items-center gap-2"><input type="number" value={tradeFee} onChange={(e)=>setTradeFee(Number(e.target.value))} className="w-16 p-1.5 bg-slate-900 border border-slate-600 rounded text-center text-rose-400 font-bold"/> %</div>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </DashboardCard>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* ======================= Tab 2 ======================= */}
+                        {activeTab === 'sim' && (
+                            <div className="animate-fade-in space-y-6">
+                                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                                    <DashboardCard title="1. 체류 시간 & 파우셋(생산)" icon="clock" className="lg:col-span-1">
+                                        <div className="space-y-5 text-sm">
+                                            <div>
+                                                <label className="text-slate-400 block mb-2 font-bold text-xs uppercase tracking-wider">하루 평균 플레이 타임</label>
+                                                <select value={playHours} onChange={e=>setPlayHours(Number(e.target.value))} className="w-full p-2.5 bg-slate-900 border border-mmo-primary text-mmo-primary font-black rounded-lg shadow-inner">
+                                                    <option value="2">2시간 (라이트 유저)</option>
+                                                    <option value="4">4시간 (코어 유저 기준점)</option>
+                                                    <option value="8">8시간 (헤비 유저/작업장 경계)</option>
+                                                </select>
+                                                <div className="flex justify-between items-center mt-2 px-1">
+                                                    <span className="text-[11px] text-slate-500">총 가용 시간</span>
+                                                    <span className="text-xs font-bold text-slate-300 bg-slate-800 px-2 py-0.5 rounded">{playMinutes} 분</span>
+                                                </div>
+                                            </div>
+
+                                            <div className="pt-4 border-t border-slate-700/50">
+                                                <label className="text-slate-400 block mb-2 font-bold text-xs uppercase tracking-wider">주력 파밍 던전 지정 (Tab 1 연동)</label>
+                                                <select value={dungeonGradeFocus} onChange={e=>setDungeonGradeFocus(Number(e.target.value))} className="w-full p-2 bg-slate-900 rounded-lg border border-slate-600 font-bold text-slate-200">
+                                                    {dungeons.map((d,i) => <option key={i} value={i}>{d.grade} 던전 (일일 {d.dailyLimit}회)</option>)}
+                                                </select>
+                                            </div>
+
+                                            <div className="pt-4 border-t border-slate-700/50 space-y-3">
+                                                <label className="text-slate-400 block font-bold text-xs uppercase tracking-wider">가용 시간 배분 흐름도</label>
+                                                
+                                                <div className="bg-slate-800 p-3 rounded-xl border border-slate-700 shadow-inner space-y-2">
+                                                    {/* 던전 시간: 1번 탭에서 자동 계산 */}
+                                                    <div className="flex justify-between items-center bg-slate-900 p-2 rounded border border-slate-700">
+                                                        <span className="text-rose-400 font-bold text-xs flex items-center gap-1"><i data-lucide="lock" className="w-3 h-3"></i> 던전 소모 시간 (고정)</span>
+                                                        <span className="text-slate-200 font-black">{macroStats.actualDungeonMins} 분</span>
+                                                    </div>
+                                                    
+                                                    {/* 남은 시간 표시 */}
+                                                    <div className="flex justify-between items-center border-b border-slate-700 pb-2 pt-1 px-1">
+                                                        <span className="text-slate-500 font-bold text-[10px] uppercase">잔여 가용 시간</span>
+                                                        <span className="text-emerald-400 font-bold text-xs">{macroStats.remainingMins} 분</span>
+                                                    </div>
+                                                    
+                                                    {/* 잔여 시간 배분 (수동 입력) */}
+                                                    <div className="flex justify-between items-center pt-1 px-1">
+                                                        <span className="text-blue-400 font-bold text-xs">잔여시간 퀘스트 투자비율</span>
+                                                        <div className="flex items-center gap-1">
+                                                            <input type="number" value={contentRatio.quest} onChange={e=>{
+                                                                let val = Math.min(100, Math.max(0, Number(e.target.value)));
+                                                                setContentRatio({...contentRatio, quest: val});
+                                                            }} className="w-14 p-1 rounded bg-slate-900 text-center border border-slate-600 text-sm font-bold text-slate-200 focus:border-mmo-primary outline-none"/>
+                                                            <span className="text-xs text-slate-400">%</span>
+                                                        </div>
+                                                    </div>
+                                                    <div className="flex justify-between items-center pb-1 px-1">
+                                                        <span className="text-slate-500 font-bold text-xs">마 마을/대기/상점 (나머지)</span>
+                                                        <span className="text-slate-400 font-bold text-sm w-16 text-center">{100 - contentRatio.quest} %</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </DashboardCard>
+
+                                    <DashboardCard title="2. 일일 평균 소비 (Sinks)" icon="hammer" className="lg:col-span-1">
+                                        <div className="space-y-4 text-sm">
+                                            <div className="bg-orange-900/10 border border-orange-900/40 p-4 rounded-xl">
+                                                <label className="text-orange-400 font-bold block mb-2 text-xs uppercase">고정 싱크 (물약, 수리, 입장료 등)</label>
+                                                <div className="relative">
+                                                    <input type="number" value={dailyFixedSink} onChange={e=>setDailyFixedSink(Number(e.target.value))} className="w-full p-2.5 pl-8 bg-slate-900 rounded-lg text-right font-bold border border-slate-600 focus:border-orange-500" />
+                                                    <span className="absolute left-3 top-2.5 text-slate-500 font-bold">G</span>
+                                                </div>
+                                            </div>
+                                            <div className="bg-purple-900/10 border border-purple-900/40 p-4 rounded-xl">
+                                                <div className="flex justify-between items-center mb-2">
+                                                    <label className="text-purple-400 font-bold text-xs uppercase">성장 싱크 (강화 등 선택 소비)</label>
+                                                    <button onClick={() => setDailyGrowthSink(vsmData.reqTotalGold)} className="text-[10px] bg-purple-500/20 hover:bg-purple-500/40 text-purple-300 px-2 py-0.5 rounded border border-purple-500/30 transition-colors">Tab 3 목표비용 동기화</button>
+                                                </div>
+                                                <div className="relative">
+                                                    <input type="number" value={dailyGrowthSink} onChange={e=>setDailyGrowthSink(Number(e.target.value))} className="w-full p-2.5 pl-8 bg-slate-900 rounded-lg text-right font-bold border border-slate-600 focus:border-purple-500" />
+                                                    <span className="absolute left-3 top-2.5 text-slate-500 font-bold">G</span>
+                                                </div>
+                                            </div>
+                                            {ecoModel !== '폐쇄' && (
+                                                <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex justify-between items-center shadow-inner">
+                                                    <div className="flex items-center gap-1.5"><i data-lucide="percent" className="w-4 h-4 text-slate-400"></i><span className="text-slate-300 text-xs font-bold uppercase">거래소 세금 소각</span></div>
+                                                    <span className="text-rose-400 font-black">-{macroStats.taxSink.toLocaleString()} G</span>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </DashboardCard>
+
+                                    <DashboardCard title="3. 인플레/디플레 체감 계수" icon="activity" className="lg:col-span-1 flex flex-col justify-center">
+                                        <div className="text-center p-6 bg-slate-800 rounded-2xl border border-slate-700 shadow-inner">
+                                            <p className="text-slate-400 text-xs mb-3 font-bold uppercase tracking-wider">1일 기준 (생산/소비) 엥겔 계수</p>
+                                            <div className="text-5xl font-black mb-4 font-mono tracking-tighter text-slate-100">
+                                                {macroStats.ratio.toFixed(2)}
+                                            </div>
+                                            <div className={`inline-block px-4 py-1.5 rounded-full text-xs font-black uppercase tracking-wider border
+                                                ${macroStats.ratio > 1.2 ? 'bg-rose-900/30 text-rose-400 border-rose-500/50' : (macroStats.ratio < 0.8 ? 'bg-blue-900/30 text-blue-400 border-blue-500/50' : 'bg-emerald-900/30 text-emerald-400 border-emerald-500/50')}
+                                            `}>
+                                                {macroStats.ratio > 1.2 ? '인플레이션 (시중 통화 과다)' : (macroStats.ratio < 0.8 ? '디플레이션 (성장 정체 폐사)' : '안정적 균형 (1:1 근접)')}
+                                            </div>
+                                        </div>
+                                        <div className="mt-6 space-y-1 text-sm bg-slate-900 p-4 rounded-xl border border-slate-800">
+                                            <div className="flex justify-between items-center text-slate-300">
+                                                <span className="text-xs">총 생산량 (Faucet)</span> 
+                                                <span className="text-emerald-400 font-black">+{macroStats.totalProduction.toLocaleString()}</span>
+                                            </div>
+                                            <div className="text-[10px] text-slate-500 text-right pb-2 border-b border-slate-800">
+                                                (던전: {macroStats.dungeonGold.toLocaleString()} G / 퀘스트: {macroStats.questGold.toLocaleString()} G)
+                                            </div>
+                                            <div className="flex justify-between items-center text-slate-300 pt-2">
+                                                <span className="text-xs">총 소비량 (Sink)</span> 
+                                                <span className="text-rose-400 font-black">-{macroStats.totalConsumption.toLocaleString()}</span>
+                                            </div>
+                                        </div>
+                                    </DashboardCard>
+                                </div>
+
+                                <DashboardCard title="장기 누적 지표 (1개월, 3개월, 1년 추적)" icon="bar-chart">
+                                    <div className="h-72 w-full mb-6">
+                                        <LongTermChart timeline={macroStats.timeline} />
+                                    </div>
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-center">
+                                        <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-sm">
+                                            <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">30일 누적 자산 잔고</p>
+                                            <p className={`text-xl font-black ${macroStats.timeline[29] > 0 ? 'text-mmo-primary' : 'text-rose-500'}`}>{macroStats.timeline[29].toLocaleString()} G</p>
+                                        </div>
+                                        <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-sm">
+                                            <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">90일 누적 (시즌1 종료)</p>
+                                            <p className={`text-xl font-black ${macroStats.timeline[89] > 0 ? 'text-mmo-primary' : 'text-rose-500'}`}>{macroStats.timeline[89].toLocaleString()} G</p>
+                                        </div>
+                                        <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-sm">
+                                            <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">365일 누적 (1주년)</p>
+                                            <p className={`text-xl font-black ${macroStats.timeline[364] > 0 ? 'text-mmo-primary' : 'text-rose-500'}`}>{macroStats.timeline[364].toLocaleString()} G</p>
+                                        </div>
+                                    </div>
+                                </DashboardCard>
+                            </div>
+                        )}
+
+                        {/* ======================= Tab 3 ======================= */}
+                        {activeTab === 'vsm' && (
+                            <div className="animate-fade-in space-y-6">
+                                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                                    
+                                    <aside className="lg:col-span-4 space-y-6">
+                                        <DashboardCard title="강화 장비 세팅 및 비용 연동" icon="crosshair">
+                                            <div className="space-y-4">
+                                                
+                                                {/* 1. 장비 등급 및 목표 레벨 세팅 */}
+                                                <div className="bg-slate-800 p-4 rounded-xl border border-slate-600 shadow-inner">
+                                                    <h4 className="text-sm font-black text-slate-100 mb-4 uppercase tracking-wider flex items-center gap-2"><i data-lucide="shield" className="w-4 h-4 text-emerald-400"></i> 장비 및 목표 셋업</h4>
+                                                    
+                                                    <div className="space-y-4">
+                                                        <div>
+                                                            <label className="text-[10px] font-bold text-slate-500 uppercase block mb-2">장비 등급 선택 (강화 비용 배수 적용)</label>
+                                                            <div className="grid grid-cols-5 gap-1">
+                                                                {EQUIP_GRADES.map((grade, idx) => (
+                                                                    <button 
+                                                                        key={idx} 
+                                                                        onClick={() => setSelectedEquipGrade(idx)}
+                                                                        className={`py-2 text-[11px] font-bold rounded border transition-colors ${selectedEquipGrade === idx ? `bg-slate-700 ${grade.color} border-${grade.color.split('-')[1]}-500 shadow-inner` : 'bg-slate-900 text-slate-500 border-slate-700 hover:bg-slate-800'}`}
+                                                                    >
+                                                                        {grade.name}
+                                                                    </button>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+
+                                                        <div>
+                                                            <div className="flex justify-between items-center mb-2">
+                                                                <label className="text-[10px] font-bold text-slate-500 uppercase">도전 강화 레벨 (1~10강)</label>
+                                                                <span className="text-sm font-black text-emerald-400">+{targetLevel} 강 도전</span>
+                                                            </div>
+                                                            <input type="range" min="1" max="10" value={targetLevel} onChange={e=>setTargetLevel(Number(e.target.value))} className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-emerald-500" />
+                                                            <div className="flex justify-between text-[9px] text-slate-500 mt-1 px-1"><span>1</span><span>5</span><span>10</span></div>
+                                                        </div>
+
+                                                        <div className="bg-slate-900 p-3 rounded-lg border border-slate-700 space-y-2 relative overflow-hidden">
+                                                            {globalMods.enhanceDiscount > 0 && <div className="absolute top-1 right-1 bg-rose-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded animate-pulse">할인 적용됨</div>}
+                                                            <div className="flex justify-between items-center">
+                                                                <span className="text-xs font-bold text-slate-400">1회 시도 비용 (G)</span>
+                                                                <span className="text-sm font-bold text-mmo-primary">{vsmData.costG.toLocaleString()} G</span>
+                                                            </div>
+                                                            <div className="flex justify-between items-center">
+                                                                <span className="text-xs font-bold text-slate-400">필요 강화석 ({STONE_GRADES[targetStoneGrade].name})</span>
+                                                                <span className={`text-sm font-bold ${STONE_GRADES[targetStoneGrade].color}`}>{vsmData.costS.toLocaleString()} 개</span>
+                                                            </div>
+                                                            <div className="flex justify-between items-center border-t border-slate-700 pt-2 mt-2">
+                                                                <span className="text-xs font-bold text-slate-300">적용 성공 확률</span>
+                                                                <span className={`text-lg font-black ${vsmData.prob === 100 ? 'text-blue-400' : (vsmData.prob > 50 ? 'text-emerald-400' : 'text-rose-400')}`}>{vsmData.prob}%</span>
+                                                            </div>
+                                                        </div>
+                                                        <p className="text-[10px] text-slate-500 leading-tight">* 비용 및 확률은 1번 탭의 설정을 기반으로 하며, 글로벌 할인율이 모두 곱해져 자동 연산됩니다.</p>
+                                                    </div>
+                                                </div>
+
+                                            </div>
+                                        </DashboardCard>
+                                    </aside>
+
+                                    <main className="lg:col-span-8 space-y-6">
+                                        <DashboardCard title="VSM (Value Stream Map): 던전별 필요 파밍 횟수 비교" icon="git-merge">
+                                            
+                                            <div className="p-4 mb-6 rounded-xl border border-slate-600 bg-slate-800 shadow-inner flex flex-col md:flex-row items-center justify-between gap-4">
+                                                <div>
+                                                    <div className="text-xs font-black uppercase tracking-widest mb-1 text-slate-400">목표 강화 달성 비용 요약</div>
+                                                    <div className="text-lg font-bold text-slate-200">
+                                                        <span className={EQUIP_GRADES[selectedEquipGrade].color}>{EQUIP_GRADES[selectedEquipGrade].name} 장비</span> 
+                                                        <i data-lucide="arrow-right" className="w-4 h-4 inline mx-2"></i>
+                                                        <span className="text-emerald-400">+{targetLevel}강 성공 기댓값</span>
+                                                    </div>
+                                                </div>
+                                                <div className="flex gap-4 text-right">
+                                                    <div>
+                                                        <div className="text-[10px] text-slate-400 mb-1">총 필요 골드 (실패 포함)</div>
+                                                        <div className="text-xl font-black text-mmo-primary">{vsmData.reqTotalGold.toLocaleString()} G</div>
+                                                    </div>
+                                                    <div>
+                                                        <div className="text-[10px] text-slate-400 mb-1">총 필요 강화석 (실패 포함)</div>
+                                                        <div className={`text-xl font-black ${STONE_GRADES[targetStoneGrade].color}`}>{vsmData.reqTotalStone.toLocaleString()} S</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            <h4 className="text-sm font-bold text-slate-300 mb-3 flex items-center gap-2"><i data-lucide="swords" className="w-4 h-4"></i> 던전 등급별 파밍 요구치 (Source)</h4>
+                                            
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                                                {vsmData.dungeonReqs.map((d, i) => (
+                                                    <div 
+                                                        key={i} 
+                                                        onClick={() => { if (d.reqRuns !== Infinity) setDungeonGradeFocus(i); }}
+                                                        className={`p-4 rounded-xl border-2 relative overflow-hidden transition-all ${d.reqRuns !== Infinity ? 'cursor-pointer' : 'opacity-70'} ${dungeonGradeFocus === i ? 'bg-slate-800 border-emerald-500 shadow-lg shadow-emerald-500/20' : 'bg-slate-900/50 border-slate-700 hover:border-slate-500 hover:bg-slate-800'}`}
+                                                    >
+                                                        {dungeonGradeFocus === i && <div className="absolute top-0 right-0 bg-emerald-500 text-slate-900 text-[10px] font-black px-2 py-1 rounded-bl-lg">선택됨</div>}
+                                                        
+                                                        <div className="flex justify-between items-center mb-2">
+                                                            <div className="font-bold text-slate-200">{d.grade} 던전</div>
+                                                            <div className="text-[10px] bg-slate-800 px-2 py-0.5 rounded text-slate-400">일일 {d.dailyLimit}회 제한</div>
+                                                        </div>
+                                                        
+                                                        <div className="py-3 text-center border-y border-slate-700 my-2">
+                                                            {d.reqRuns === Infinity ? (
+                                                                <div className="text-xl font-black text-rose-500 py-1">드랍 불가</div>
+                                                            ) : (
+                                                                <>
+                                                                    <div className="text-3xl font-black text-slate-100">{d.reqRuns}<span className="text-sm font-normal text-slate-400 ml-1">회</span></div>
+                                                                    <div className="text-xs text-emerald-400 font-bold mt-1">총 {d.runTimeTotal}분 소요</div>
+                                                                </>
+                                                            )}
+                                                        </div>
+                                                        
+                                                        <div className="text-center text-xs">
+                                                            {d.reqRuns === Infinity ? (
+                                                                <span className="text-rose-400">해당 등급 강화석 미드랍</span>
+                                                            ) : (
+                                                                <span className={d.daysNeeded > 1 ? 'text-orange-400 font-bold' : 'text-slate-400'}>
+                                                                    일일 제한 고려시: {d.daysNeeded} 일 소요
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+
+                                            <div className="flex items-center justify-center gap-4 mb-6">
+                                                <i data-lucide="arrow-down" className="text-slate-600 w-6 h-6 animate-bounce"></i>
+                                            </div>
+
+                                            {/* 스플릿 컨테이너 (Value vs Waste) */}
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                <div className="p-4 bg-emerald-900/20 border border-emerald-500/30 rounded-xl flex items-center justify-between shadow-md">
+                                                    <div>
+                                                        <div className="text-xs font-black uppercase text-emerald-400 mb-1 flex items-center gap-1"><i data-lucide="check-circle-2" className="w-4 h-4"></i> 가치 창출 (성공)</div>
+                                                        <div className="text-[10px] text-slate-400">단 1회의 성공에 쓰인 재화</div>
+                                                    </div>
+                                                    <div className="text-right">
+                                                        <div className="text-sm font-bold text-slate-200">-{vsmData.successGold.toLocaleString()} G</div>
+                                                        <div className="text-xs text-slate-400">-{vsmData.successStone.toLocaleString()} S</div>
+                                                    </div>
+                                                </div>
+                                                
+                                                <div className="p-4 bg-rose-900/20 border border-rose-500/40 rounded-xl flex items-center justify-between shadow-md relative overflow-hidden">
+                                                    {vsmData.wasteGold > 0 && <div className="absolute top-0 right-0 w-8 h-8 bg-rose-500/20 rounded-bl-full flex items-start justify-end p-1"><span className="animate-ping absolute h-2 w-2 rounded-full bg-rose-400 opacity-75"></span></div>}
+                                                    <div>
+                                                        <div className="text-xs font-black uppercase text-rose-400 mb-1 flex items-center gap-1"><i data-lucide="flame" className="w-4 h-4"></i> 낭비 (실패로 증발)</div>
+                                                        <div className="text-[10px] text-rose-400/80">({(vsmData.expectedTries - 1).toFixed(1)}회 실패 기댓값)</div>
+                                                    </div>
+                                                    <div className="text-right">
+                                                        <div className="text-sm font-bold text-rose-300">-{vsmData.wasteGold.toLocaleString()} G</div>
+                                                        <div className="text-xs text-rose-400">-{vsmData.wasteStone.toLocaleString()} S</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                        </DashboardCard>
+                                    </main>
+
+                                    {/* 일일 콘텐츠 활동 에디터 테이블 */}
+                                    <div className="lg:col-span-12">
+                                        <DashboardCard title="일일 콘텐츠 활동 (Daily Content Activity) 에디터" icon="table">
+                                            <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+                                                <p className="text-xs text-slate-400">
+                                                    이 테이블은 <b>유저가 하루에 겪는 획득/소모 흐름</b>을 직접 조작하며 실험하는 공간입니다. <span className="text-emerald-400 font-bold">실행 횟수</span>를 마음껏 조작하여 최종 순수익을 확인해 보세요.<br/>
+                                                    <span className="text-rose-400 text-[10px]">* 우측 버튼을 누르면 수동 조작 내역이 초기화되고, 상단 VSM 시뮬레이션 결과값으로 덮어씌워집니다.</span>
+                                                </p>
+                                                <button onClick={syncTableWithVsm} className="shrink-0 bg-slate-700 hover:bg-rose-600 text-slate-200 text-xs font-bold py-2 px-4 rounded-lg shadow-lg flex items-center gap-2 transition-colors border border-slate-600 hover:border-rose-500">
+                                                    <i data-lucide="rotate-ccw" className="w-4 h-4"></i> VSM 계산값으로 초기화 (덮어쓰기)
+                                                </button>
+                                            </div>
+                                            <div className="overflow-x-auto rounded-xl border border-slate-700">
+                                                <table className="w-full text-sm text-center border-collapse">
+                                                    <thead className="bg-slate-900 border-b border-slate-700 text-slate-400 text-xs">
+                                                        <tr>
+                                                            <th className="py-3 px-2 border-r border-slate-700 w-16 font-bold">유형</th>
+                                                            <th className="py-3 px-2 border-r border-slate-700 text-left font-bold">활동명 (콘텐츠/싱크)</th>
+                                                            <th className="py-3 px-2 border-r border-slate-700 w-24 font-bold text-emerald-400 bg-emerald-900/20">실행 횟수</th>
+                                                            <th className="py-3 px-2 border-r border-slate-700 w-24 font-bold">1회 기준 골드</th>
+                                                            <th className="py-3 px-2 border-r border-slate-700 w-24 font-bold">1회 기준 강화석</th>
+                                                            <th className="py-3 px-2 border-r border-slate-700 w-20 font-bold">1회 소요 시간</th>
+                                                            <th className="py-3 px-4 font-black text-mmo-primary bg-slate-800 text-right">해당 행 총계 (Total)</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-700/50 bg-slate-800/50">
+                                                        {vsmActivities.map(act => (
+                                                            <tr key={act.id} className="hover:bg-slate-800 transition-colors">
+                                                                <td className="py-2 px-2 border-r border-slate-700">
+                                                                    {act.type === 'source' ? <span className="bg-blue-900/50 text-blue-400 px-2 py-1 rounded text-[10px] font-bold">생산</span> : 
+                                                                    <span className="bg-orange-900/50 text-orange-400 px-2 py-1 rounded text-[10px] font-bold">소비</span>}
+                                                                </td>
+                                                                <td className="py-2 px-2 border-r border-slate-700 text-left font-bold text-slate-300">{act.name}</td>
+                                                                <td className="py-2 px-2 border-r border-slate-700 bg-emerald-900/10"><input type="number" value={act.count} onChange={e=>handleVsmChange(act.id, 'count', e.target.value)} className="w-full bg-slate-900 border border-emerald-500/50 rounded p-1.5 text-center text-sm font-black text-emerald-400 focus:border-emerald-400 focus:outline-none shadow-inner" /></td>
+                                                                <td className="py-2 px-2 border-r border-slate-700"><input type="number" value={act.gold} onChange={e=>handleVsmChange(act.id, 'gold', e.target.value)} className={`w-full bg-slate-900 border border-slate-600 rounded p-1.5 text-right text-xs font-bold focus:border-mmo-primary focus:outline-none ${act.type==='source'?'text-blue-400':'text-orange-400'}`} /></td>
+                                                                <td className="py-2 px-2 border-r border-slate-700"><input type="number" value={act.stone} onChange={e=>handleVsmChange(act.id, 'stone', e.target.value)} className="w-full bg-slate-900 border border-slate-600 rounded p-1.5 text-right text-xs text-slate-200 focus:border-purple-400 focus:outline-none" /></td>
+                                                                <td className="py-2 px-2 border-r border-slate-700"><input type="number" value={act.time} onChange={e=>handleVsmChange(act.id, 'time', e.target.value)} className="w-full bg-slate-900 border border-slate-600 rounded p-1.5 text-center text-xs text-slate-200 focus:border-mmo-primary focus:outline-none" /></td>
+                                                                <td className="py-2 px-4 text-right bg-slate-800/80">
+                                                                    <div className={`text-sm font-black ${act.type==='source'?'text-blue-400':'text-rose-400'}`}>{(act.count * act.gold).toLocaleString()} <span className="text-[10px] font-normal">G</span></div>
+                                                                    <div className={`text-xs font-bold ${act.type==='source'?'text-purple-400':'text-rose-400/80'}`}>{(act.count * act.stone).toFixed(1)} <span className="text-[10px] font-normal">S</span></div>
+                                                                    <div className="text-[10px] text-slate-400 font-bold mt-0.5">{(act.count * act.time).toLocaleString()} 분</div>
+                                                                </td>
+                                                            </tr>
+                                                        ))}
+                                                        
+                                                        {/* --- 총 생산 요약 --- */}
+                                                        <tr className="bg-blue-900/20 text-blue-400 border-t-2 border-blue-500/30">
+                                                            <td colSpan="6" className="py-3 px-4 border-r border-slate-700 text-right text-xs font-bold uppercase tracking-wider">총 생산 (Total Production)</td>
+                                                            <td className="py-3 px-4 text-right font-black">
+                                                                <div>+{vsmTableStats.prod.gold.toLocaleString()} G</div>
+                                                                <div className="text-purple-400 text-xs">+{vsmTableStats.prod.stone.toFixed(1)} S</div>
+                                                                <div className="text-slate-400 text-[10px] mt-0.5">{vsmTableStats.prod.time.toLocaleString()} 분</div>
+                                                            </td>
+                                                        </tr>
+                                                        
+                                                        {/* --- 총 소비 요약 --- */}
+                                                        <tr className="bg-orange-900/20 text-orange-400 border-b-2 border-orange-500/30">
+                                                            <td colSpan="6" className="py-3 px-4 border-r border-slate-700 text-right text-xs font-bold uppercase tracking-wider">총 소비 (Total Consumption)</td>
+                                                            <td className="py-3 px-4 text-right font-black">
+                                                                <div>-{vsmTableStats.cons.gold.toLocaleString()} G</div>
+                                                                <div className="text-rose-400 text-xs">-{vsmTableStats.cons.stone.toFixed(1)} S</div>
+                                                                <div className="text-slate-400 text-[10px] mt-0.5">{vsmTableStats.cons.time.toLocaleString()} 분</div>
+                                                            </td>
+                                                        </tr>
+                                                        
+                                                        {/* --- 최종 순수익 --- */}
+                                                        <tr className="bg-slate-900 font-black text-lg">
+                                                            <td colSpan="6" className="py-5 px-4 border-r border-slate-700 text-right text-slate-200 uppercase tracking-widest">최종 일일 순수익 (Net Balance)</td>
+                                                            <td className="py-5 px-4 text-right">
+                                                                <div className={`${vsmTableStats.prod.gold >= vsmTableStats.cons.gold ? 'text-emerald-400' : 'text-rose-500'}`}>
+                                                                    {vsmTableStats.prod.gold >= vsmTableStats.cons.gold ? '+' : ''}{(vsmTableStats.prod.gold - vsmTableStats.cons.gold).toLocaleString()} G
+                                                                </div>
+                                                                <div className={`text-sm mt-1 ${vsmTableStats.prod.stone >= vsmTableStats.cons.stone ? 'text-emerald-400' : 'text-rose-500'}`}>
+                                                                    {vsmTableStats.prod.stone >= vsmTableStats.cons.stone ? '+' : ''}{(vsmTableStats.prod.stone - vsmTableStats.cons.stone).toFixed(1)} S
+                                                                </div>
+                                                                <div className="text-[11px] text-slate-400 font-bold mt-2">총 리드타임: {vsmTableStats.leadTime}분</div>
+                                                            </td>
+                                                        </tr>
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </DashboardCard>
+                                    </div>
+                                    {/* --------------------------------- */}
+
+                                </div>
+                            </div>
+                        )}
+                    </main>
+                    <footer className="mt-8 py-6 text-center text-slate-600 text-[10px] font-bold uppercase tracking-widest border-t border-slate-800">
+                        MMORPG Economy Balance Simulator &bull; Enhanced with AI Studio VSM Logic
+                    </footer>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
